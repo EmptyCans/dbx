@@ -1177,9 +1177,9 @@ mod tests {
     use super::db;
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, filter_mysql_system_databases_for_config,
-        filter_table_infos, is_agent_postgres_metadata_fallback_config, mysql_table_metadata_catalog,
-        normalize_information_schema_table_type, oracle_table_comment_from_query_result, oracle_table_comment_sql,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
+        filter_table_infos, is_agent_postgres_metadata_fallback_config, is_retryable_metadata_error,
+        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_table_comment_from_query_result,
+        oracle_table_comment_sql, presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
     };
     #[cfg(feature = "duckdb-bundled")]
     use super::{
@@ -1255,6 +1255,14 @@ mod tests {
     fn mysql_table_child_metadata_uses_database_not_schema() {
         assert_eq!(mysql_table_metadata_catalog("app_db", ""), "app_db");
         assert_eq!(mysql_table_metadata_catalog("app_db", "public"), "app_db");
+    }
+
+    #[test]
+    fn metadata_retry_recovers_missing_pool_only_as_transient_state() {
+        assert!(is_retryable_metadata_error("Pool not found"));
+        assert!(is_retryable_metadata_error("connection reset by peer"));
+        assert!(!is_retryable_metadata_error("Unknown column 'email' in 'field list'"));
+        assert!(!is_retryable_metadata_error("Access denied for user"));
     }
 
     fn test_table_info(name: &str) -> super::db::TableInfo {
@@ -2175,12 +2183,16 @@ where
 {
     let result = operation().await;
     match result {
-        Err(error) if crate::query::is_connection_error(&error) => {
+        Err(error) if is_retryable_metadata_error(&error) => {
             state.reconnect_pool(connection_id, database).await?;
             operation().await
         }
         _ => result,
     }
+}
+
+fn is_retryable_metadata_error(error: &str) -> bool {
+    error == "Pool not found" || crate::query::is_connection_error(error)
 }
 
 pub async fn get_columns_core(
