@@ -352,33 +352,17 @@ fn cte_main_statement_is_select(sql: &str) -> bool {
         index += 1;
     }
 
-    loop {
-        if tokens.get(index).is_some_and(|token| token.text != "AS") {
-            index += 1;
-        }
-        if tokens.get(index).is_none_or(|token| token.text != "AS") {
-            return false;
+    while let Some(token) = tokens.get(index) {
+        if is_with_main_statement_keyword(&token.text) {
+            return token.text == "SELECT";
         }
         index += 1;
-
-        if tokens.get(index).is_some_and(|token| token.text == "NOT") {
-            index += 1;
-            if tokens.get(index).is_none_or(|token| token.text != "MATERIALIZED") {
-                return false;
-            }
-            index += 1;
-        } else if tokens.get(index).is_some_and(|token| token.text == "MATERIALIZED") {
-            index += 1;
-        }
-
-        let Some(token) = tokens.get(index) else {
-            return false;
-        };
-        if tokens.get(index + 1).is_some_and(|next| next.text == "AS") {
-            continue;
-        }
-        return token.text == "SELECT";
     }
+    false
+}
+
+fn is_with_main_statement_keyword(token: &str) -> bool {
+    matches!(token, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
 }
 
 fn single_statement_error_reason(original_sql: &str) -> &'static str {
@@ -1438,6 +1422,50 @@ WHERE u.id = picked.id;
             result.sql.unwrap(),
             "WITH picked AS (SELECT id FROM app_users LIMIT 10) SELECT * FROM picked LIMIT 100;"
         );
+    }
+
+    #[test]
+    fn clickhouse_scalar_with_select_is_paginated() {
+        let sql = "WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 50,
+            offset: 100,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept LIMIT 50 OFFSET 100;"
+        );
+    }
+
+    #[test]
+    fn clickhouse_scalar_with_select_can_be_counted() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept"
+                .to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT COUNT(*) AS dbx_total_rows FROM (WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn clickhouse_scalar_with_update_is_not_paginated() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "WITH 1 AS min_id UPDATE employees SET dept = 'sales' WHERE id = min_id".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 50,
+            offset: 0,
+        });
+
+        assert_eq!(result, err("not_select"));
     }
 
     #[test]
