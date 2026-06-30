@@ -1692,7 +1692,22 @@ impl StreamingToolCallAccumulator {
         match event {
             StreamToolEvent::Chunk(chunk) => on_chunk(chunk),
             StreamToolEvent::ToolCallStart { index, id, name } => {
-                self.calls.insert(index, PartialToolCall { id, name, arguments: String::new() });
+                // Merge with any existing entry for this index instead of
+                // overwriting it. Some OpenAI-compatible providers (e.g. GLM)
+                // re-send `id` (as an empty string) or omit `name` on
+                // subsequent delta chunks; a blind insert would wipe a
+                // previously-correct name and reset accumulated arguments,
+                // producing "Unknown tool:" errors.
+                if let Some(existing) = self.calls.get_mut(&index) {
+                    if !id.is_empty() {
+                        existing.id = id;
+                    }
+                    if !name.is_empty() {
+                        existing.name = name;
+                    }
+                } else {
+                    self.calls.insert(index, PartialToolCall { id, name, arguments: String::new() });
+                }
                 if !self.ordered_indices.contains(&index) {
                     self.ordered_indices.push(index);
                 }
@@ -2025,8 +2040,11 @@ async fn stream_openai_with_tools(
                         if let Some(tool_calls) = event["choices"].get(0).and_then(|c| c["delta"]["tool_calls"].as_array()) {
                             for tc in tool_calls {
                                 let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                // First chunk for this tool call has id and name
-                                if let Some(id) = tc["id"].as_str() {
+                                // The first delta carries the tool call id and
+                                // function name. Some OpenAI-compatible providers
+                                // (e.g. GLM) send id="" on subsequent deltas, so
+                                // only a non-empty id marks a genuine start.
+                                if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
                                     let name = tc["function"]["name"].as_str().unwrap_or_default().to_string();
                                     on_event(StreamToolEvent::ToolCallStart { index: idx, id: id.to_string(), name });
                                 }
@@ -2447,6 +2465,38 @@ mod tests {
         AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent, StreamingToolCallAccumulator, ToolCallRef,
         AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
+
+    /// Reproduce the "Unknown tool:" bug: some OpenAI-compatible providers
+    /// (e.g. GLM via proxy) re-send the `id` field in every tool-call delta.
+    /// The second delta carries `id` but omits `function.name`, so the OpenAI
+    /// parser emits a second ToolCallStart with an empty name. The
+    /// accumulator's `insert` then overwrites the previously-correct name.
+    #[test]
+    fn accumulator_preserves_name_when_provider_resends_id() {
+        let mut acc = StreamingToolCallAccumulator::new();
+        let noop = |_chunk| {};
+
+        // First chunk: id + name present (standard OpenAI first delta)
+        acc.process(
+            StreamToolEvent::ToolCallStart { index: 0, id: "call_1".to_string(), name: "get_columns".to_string() },
+            &noop,
+        );
+        acc.process(StreamToolEvent::ToolCallDelta { index: 0, fragment: "{\"table\":".to_string() }, &noop);
+
+        // Second chunk: provider re-sends `id` but omits `function.name`.
+        // The OpenAI parser sees `id` is Some and emits ToolCallStart with
+        // name = "" (from unwrap_or_default()).
+        acc.process(StreamToolEvent::ToolCallStart { index: 0, id: "call_1".to_string(), name: String::new() }, &noop);
+        acc.process(StreamToolEvent::ToolCallDelta { index: 0, fragment: "\"record_trip_id_t\"}".to_string() }, &noop);
+
+        let calls = acc.finalize();
+        assert_eq!(calls.len(), 1, "expected exactly one accumulated tool call");
+        assert_eq!(
+            calls[0].name, "get_columns",
+            "tool name was wiped to empty by a re-sent ToolCallStart — this is the \"Unknown tool:\" bug"
+        );
+        assert_eq!(calls[0].arguments["table"], "record_trip_id_t", "arguments were reset by a re-sent ToolCallStart");
+    }
 
     #[test]
     fn stream_line_decoder_preserves_split_multibyte_utf8() {
