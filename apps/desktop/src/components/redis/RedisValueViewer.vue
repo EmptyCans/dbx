@@ -114,14 +114,6 @@ const hashCollectionRows = computed<RedisCollectionRow[]>(() =>
   })),
 );
 
-function redisGlobEscape(s: string): string {
-  return s.replace(/[*?[\]\\]/g, "\\$&");
-}
-
-function hashSearchPattern(query: string): string | undefined {
-  return query ? `*${redisGlobEscape(query)}*` : undefined;
-}
-
 let hashSearchTimer: ReturnType<typeof setTimeout> | null = null;
 let hashSearchRequestId = 0;
 
@@ -151,7 +143,7 @@ async function onHashSearch() {
   const requestId = ++hashSearchRequestId;
   searchLoading.value = true;
   try {
-    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 200, hashSearchPattern(query));
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 200, query || undefined);
     if (requestId !== hashSearchRequestId) return;
     const items = Array.isArray(result.value) ? result.value : [];
     activeHashSearchQuery.value = query;
@@ -326,7 +318,7 @@ async function load(options: { selectDefaultMember?: boolean } = {}) {
 async function loadMore() {
   if (!data.value || !hasMore.value || loadingMore.value || (data.value.key_type === "hash" && searchLoading.value)) return;
   const keyType = data.value.key_type;
-  const hashFilter = keyType === "hash" ? hashSearchPattern(activeHashSearchQuery.value) : undefined;
+  const hashFilter = keyType === "hash" ? activeHashSearchQuery.value || undefined : undefined;
   const requestId = hashSearchRequestId;
   loadingMore.value = true;
   try {

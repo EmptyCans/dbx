@@ -1861,7 +1861,7 @@ export default {
     searchByKey: "Key",
     searchByValue: "Value",
     searchByAll: "All",
-    searchFields: "Search fields",
+    searchFields: "Search fields and values",
     keys: "{count} keys",
     loadedKeys: "{loaded} / {total} keys loaded",
     loadingKeys: "Loading keys...",
