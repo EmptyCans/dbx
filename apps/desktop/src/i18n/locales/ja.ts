@@ -1585,6 +1585,7 @@ export default withEnglishFallback({
     sequences: "シーケンス",
     packages: "パッケージ",
     partitions: "パーティション",
+    childTables: "子テーブル",
     loadMore: "もっと読み込む...",
     objectBrowser: "オブジェクトブラウザで参照（{count}件）",
     linkedServers: "リンクサーバー",
