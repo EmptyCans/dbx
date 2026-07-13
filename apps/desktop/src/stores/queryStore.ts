@@ -28,7 +28,7 @@ import { redisCommandResultToQueryResult } from "@/lib/redis/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { usesAgentCursorForQuery } from "@/lib/database/databaseDriverManifest";
-import { canUseKeylessRowPredicate, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { canUseKeylessRowPredicate, DBX_ROWID_COLUMN, editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
@@ -2209,6 +2209,14 @@ export const useQueryStore = defineStore("query", () => {
     return primaryKeys.filter((primaryKey) => !selectedColumns.has(primaryKey.toLowerCase()));
   }
 
+  async function oracleRowIdIsSafeForQuery(tab: QueryTab, loaded: LoadedEditableSource): Promise<boolean> {
+    const knownType = loaded.tableMeta.tableType?.trim().toUpperCase();
+    if (knownType) return knownType === "TABLE";
+    const objects = await api.listObjects(tab.connectionId!, tab.database, loaded.tableMeta.schema ?? "", ["TABLE", "VIEW", "MATERIALIZED_VIEW"], loaded.tableMeta.tableName, 20, 0, loaded.tableMeta.catalog);
+    const matching = objects.find((object) => object.name.toLowerCase() === loaded.tableMeta.tableName.toLowerCase());
+    return matching?.object_type.trim().toUpperCase() === "TABLE";
+  }
+
   async function prepareEditableQueryExecution(tab: QueryTab, sql: string, conn: ConnectionConfig | undefined, databaseType: DatabaseType | undefined, traceId: string, elapsed: () => string): Promise<EditableQueryExecutionPreparation> {
     const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [] };
     if (!databaseType || !HIDDEN_QUERY_KEY_DATABASE_TYPES.has(databaseType) || !tab.connectionId || !tab.database) return unchanged;
@@ -2218,27 +2226,32 @@ export const useQueryStore = defineStore("query", () => {
       if (!editability.editable || !editability.analysis) return unchanged;
       const analysis = editability.analysis;
       const sources = editableQuerySources(analysis);
-      if (sources.length !== 1 || analysis.distinct || analysis.selectStar) return unchanged;
+      if (sources.length !== 1 || analysis.distinct) return unchanged;
 
       const loaded = await loadEditableQuerySource(tab, analysis, sources[0]!, conn, databaseType, traceId, elapsed);
       if (loaded.tableMeta.tableType?.toUpperCase().includes("VIEW")) return unchanged;
       const metadataAnalysis = expandStarProjectionColumnsForSource(bindUnqualifiedColumnsForSource(loaded.analysis, loaded.source, loaded.tableMeta.columns), loaded.source, loaded.tableMeta.columns);
-      // Hidden row identifiers are limited to declared primary keys. Unique
-      // indexes, views, and synthetic ROWID fallbacks keep the prior behavior.
-      const primaryKeys = loaded.tableMeta.columns.filter((column) => column.is_primary_key).map((column) => column.name);
-      if (primaryKeys.length === 0) return unchanged;
+      const declaredPrimaryKeys = loaded.tableMeta.columns.filter((column) => column.is_primary_key).map((column) => column.name);
+      // Oracle base tables without declared keys use the same ROWID identity as
+      // table-data tabs. Confirm the object is a base table because selecting
+      // ROWID from a view can fail with ORA-01445.
+      if (databaseType === "oracle" && declaredPrimaryKeys.length === 0 && !(await oracleRowIdIsSafeForQuery(tab, loaded))) return unchanged;
+      const primaryKeys = editablePrimaryKeys(databaseType, loaded.tableMeta.columns, loaded.tableMeta.tableType);
 
-      const missingPrimaryKeys = missingPrimaryKeysForSource(primaryKeys, metadataAnalysis, loaded.source.key);
+      const missingPrimaryKeys = declaredPrimaryKeys.length === 0 ? primaryKeys : missingPrimaryKeysForSource(primaryKeys, metadataAnalysis, loaded.source.key);
       if (missingPrimaryKeys.length === 0) return unchanged;
       const primaryKeySet = new Set(primaryKeys.map((primaryKey) => primaryKey.toLowerCase()));
-      const hasWritableProjection = metadataAnalysis.columns.some((column) => column.sourceName && column.sourceKey === loaded.source.key && !primaryKeySet.has(column.sourceName.toLowerCase()));
+      const hasWritableProjection = metadataAnalysis.selectStar
+        ? loaded.tableMeta.columns.some((column) => !primaryKeySet.has(column.name.toLowerCase()))
+        : metadataAnalysis.columns.some((column) => column.sourceName && column.sourceKey === loaded.source.key && !primaryKeySet.has(column.sourceName.toLowerCase()));
       if (!hasWritableProjection) return unchanged;
 
       const rewritten = buildQueryWithHiddenPrimaryKeys({
         sql,
         databaseType,
         primaryKeys: missingPrimaryKeys,
-        existingResultNames: metadataAnalysis.columns.map((column) => column.resultName),
+        existingResultNames: metadataAnalysis.selectStar ? loaded.tableMeta.columns.map((column) => column.name) : metadataAnalysis.columns.map((column) => column.resultName),
+        sourceExpressions: databaseType === "oracle" && missingPrimaryKeys.includes(DBX_ROWID_COLUMN) ? { [DBX_ROWID_COLUMN]: "ROWIDTOCHAR(ROWID)" } : undefined,
       });
       if (!rewritten) return unchanged;
       console.info("[DBX][executeTabSql:hidden-primary-keys]", {
@@ -2256,7 +2269,7 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  async function buildQueryMetadataPatch(tab: QueryTab, sql: string, traceId?: string, elapsed?: () => string): Promise<QueryMetadataPatch | undefined> {
+  async function buildQueryMetadataPatch(tab: QueryTab, sql: string, traceId?: string, elapsed?: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = []): Promise<QueryMetadataPatch | undefined> {
     if (tab.mode !== "query") return;
     if (!tab.result || !tab.result.columns.length) {
       return {
@@ -2330,7 +2343,13 @@ export const useQueryStore = defineStore("query", () => {
       if (loadedSources.length === 1) {
         const loaded = loadedSources[0]!;
         const metadataAnalysis = expandStarProjectionColumnsForSource(bindUnqualifiedColumnsForSource(loaded.analysis, loaded.source, loaded.tableMeta.columns, allSourceColumns), loaded.source, loaded.tableMeta.columns);
-        const primaryKeys = loaded.tableMeta.primaryKeys;
+        const syntheticRowIdProjection = hiddenPrimaryKeys.find((projection) => projection.sourceName.toUpperCase() === DBX_ROWID_COLUMN);
+        const primaryKeys = loaded.tableMeta.primaryKeys.length === 0 && syntheticRowIdProjection ? [DBX_ROWID_COLUMN] : loaded.tableMeta.primaryKeys;
+        const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result.columns, loaded.source.key);
+        if (sourceColumns && syntheticRowIdProjection) {
+          const resultIndex = tab.result.columns.findIndex((column) => column.toLowerCase() === syntheticRowIdProjection.alias.toLowerCase());
+          if (resultIndex >= 0) sourceColumns[resultIndex] = DBX_ROWID_COLUMN;
+        }
         if (primaryKeys.length === 0 && !canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys)) {
           return {
             queryAnalysis: undefined,
@@ -2340,7 +2359,8 @@ export const useQueryStore = defineStore("query", () => {
           };
         }
 
-        if (!allPrimaryKeysPresent(primaryKeys, tab.result.columns, metadataAnalysis, loaded.source.key)) {
+        const primaryKeysPresent = syntheticRowIdProjection ? sourceColumns?.some((column) => column?.toUpperCase() === DBX_ROWID_COLUMN) === true : allPrimaryKeysPresent(primaryKeys, tab.result.columns, metadataAnalysis, loaded.source.key);
+        if (!primaryKeysPresent) {
           return {
             queryAnalysis: undefined,
             querySourceColumns: undefined,
@@ -2360,9 +2380,9 @@ export const useQueryStore = defineStore("query", () => {
 
         return {
           queryAnalysis: metadataAnalysis,
-          querySourceColumns: sourceColumnsForResult(metadataAnalysis, tab.result.columns, loaded.source.key),
+          querySourceColumns: sourceColumns,
           queryEditabilityReason: undefined,
-          tableMeta: loaded.tableMeta,
+          tableMeta: primaryKeys === loaded.tableMeta.primaryKeys ? loaded.tableMeta : { ...loaded.tableMeta, primaryKeys },
         };
       }
 
@@ -2412,7 +2432,7 @@ export const useQueryStore = defineStore("query", () => {
       const tab = tabs.value.find((t) => t.id === tabId);
       if (!tab || tab.result !== result) return;
       console.info("[DBX][executeTabSql:metadata:start]", { traceId, elapsed: elapsed() });
-      const patch = await buildQueryMetadataPatch(tab, sql, traceId, elapsed);
+      const patch = await buildQueryMetadataPatch(tab, sql, traceId, elapsed, hiddenPrimaryKeys);
       if (patch?.queryAnalysis && hiddenPrimaryKeys.length > 0) {
         patch.queryAnalysis = { ...patch.queryAnalysis, allowInsert: false };
       }
