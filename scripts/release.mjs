@@ -10,6 +10,9 @@ const PACKAGE_TAG_PREFIX = "packages-v";
 const AGENT_TAG_PREFIX = "agents-v";
 const APP_TAG_PREFIX = "v";
 const PACKAGE_RELEASE_PATHS = [
+  "packages/mongo-shell/src/",
+  "packages/mongo-shell/package.json",
+  "packages/mongo-shell/tsconfig.json",
   "packages/node-core/src/",
   "packages/node-core/README.md",
   "packages/node-core/package.json",
@@ -255,6 +258,7 @@ function getLatestPackageVersion() {
   if (tag) return tag.versionText;
 
   const packageVersions = [
+    "packages/mongo-shell/package.json",
     "packages/node-core/package.json",
     "packages/cli/package.json",
     "packages/mcp-server/package.json",
